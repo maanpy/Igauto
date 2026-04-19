@@ -88,12 +88,11 @@ def load_session() -> bool:
     """
     Load Instagram session from IG_SESSION_JSON env var.
 
-    Accepts:
-      - Browser cookie list: [{"name":"sessionid","value":"..."},...]
-      - Flat cookie dict:    {"sessionid":"...","csrftoken":"..."}
-      - Full instagrapi settings JSON (from get_session.py)
-
-    Uses login_by_sessionid() — the most reliable auth path in instagrapi.
+    We do NOT call login_by_sessionid() or any verification endpoint —
+    Railway's server IP is unknown to Instagram and triggers a challenge.
+    Instead we inject the sessionid cookie directly into the requests session,
+    which is exactly what instagrapi uses under the hood anyway.
+    The session will be validated lazily on the first real API call.
     """
     import traceback
     global state
@@ -107,89 +106,92 @@ def load_session() -> bool:
     try:
         session_data = json.loads(raw)
     except json.JSONDecodeError as e:
-        logger.error(f"IG_SESSION_JSON JSON parse error: {e}")
+        logger.error(f"IG_SESSION_JSON is not valid JSON: {e}")
         return False
 
-    # ── Extract sessionid from any format ─────────────────────────────────
-    sessionid = ""
+    # ── Flatten to a simple cookie dict ───────────────────────────────────
+    cookies: dict = {}
 
     if isinstance(session_data, list):
-        # [{"name":"sessionid","value":"..."},...]
-        flat = {c["name"]: c["value"] for c in session_data if "name" in c and "value" in c}
-        sessionid = flat.get("sessionid", "")
-        logger.info(f"Format: browser cookie list ({len(session_data)} cookies)")
+        # Browser export: [{"name":"sessionid","value":"..."},...]
+        cookies = {
+            c["name"]: c["value"]
+            for c in session_data
+            if isinstance(c, dict) and "name" in c and "value" in c
+        }
+        logger.info(f"Format: browser cookie list ({len(session_data)} items) → {list(cookies.keys())}")
 
     elif isinstance(session_data, dict):
-        # Try direct key first
-        sessionid = session_data.get("sessionid", "")
-
-        # Try nested under "cookies"
-        if not sessionid and isinstance(session_data.get("cookies"), dict):
-            sessionid = session_data["cookies"].get("sessionid", "")
-
-        # Full instagrapi settings — use set_settings path
-        if not sessionid and ("authorization_data" in session_data or "uuids" in session_data):
-            logger.info("Format: full instagrapi settings — using set_settings...")
-            try:
-                cl = Client()
-                cl.delay_range = [API_DELAY, API_DELAY + 0.5]
-                cl.set_settings(session_data)
-                if IG_USER_ID:
-                    cl.user_id = int(IG_USER_ID)
-                state.ig = cl
-                state.ready = True
-                state.user_id_num = cl.user_id
-                state.username = IG_USERNAME or f"uid:{cl.user_id}"
-                logger.info(f"✅ Session loaded via set_settings — user_id={cl.user_id}")
-                return True
-            except Exception as e:
-                logger.error(f"set_settings path failed: {e}\n{traceback.format_exc()}")
-                return False
-
-        if sessionid:
+        # Full instagrapi settings JSON
+        if "authorization_data" in session_data or "uuids" in session_data:
+            nested = session_data.get("cookies", {})
+            cookies = nested if isinstance(nested, dict) else {}
+            # Merge top-level keys that look like cookies
+            for k in ("sessionid", "csrftoken", "ds_user_id", "mid", "rur", "ig_did"):
+                if k in session_data:
+                    cookies[k] = session_data[k]
+            logger.info("Format: full instagrapi settings")
+        # Flat cookie dict
+        elif "sessionid" in session_data:
+            cookies = session_data
             logger.info("Format: flat cookie dict")
         else:
-            logger.error(f"No sessionid found. Dict keys: {list(session_data.keys())[:10]}")
+            logger.error(f"Unrecognized dict. Keys: {list(session_data.keys())[:10]}")
             return False
     else:
         logger.error(f"Unexpected JSON type: {type(session_data).__name__}")
         return False
 
+    sessionid = cookies.get("sessionid", "").strip()
     if not sessionid:
-        logger.error("sessionid is empty after parsing. Check your cookie export.")
+        logger.error("No 'sessionid' value found after parsing. Cannot authenticate.")
         return False
 
-    logger.info(f"sessionid found: ***{sessionid[-6:]} (last 6 chars)")
+    logger.info(f"sessionid extracted: ***{sessionid[-8:]} (last 8 chars)")
 
-    # ── Login using sessionid — the correct instagrapi method ─────────────
-    # login_by_sessionid sets the cookie + fetches user info in one call.
+    # ── Build client and inject cookies without any API call ──────────────
     try:
         cl = Client()
         cl.delay_range = [API_DELAY, API_DELAY + 0.5]
-        logger.info("Calling login_by_sessionid()...")
-        cl.login_by_sessionid(sessionid)
-        logger.info(f"login_by_sessionid() succeeded — user_id={cl.user_id}")
+
+        # Inject all cookies directly into the underlying requests.Session
+        # This is safe — instagrapi reads from this same cookie jar for every request
+        for name, value in cookies.items():
+            cl.private.cookies.set(name, str(value), domain=".instagram.com")
+            cl.private.cookies.set(name, str(value), domain="i.instagram.com")
+
+        logger.info(f"Cookies injected: {list(cookies.keys())}")
+
+        # Set user_id via the internal attribute (avoids read-only property)
+        uid_str = (
+            IG_USER_ID
+            or cookies.get("ds_user_id", "")
+            or str(session_data.get("user_id", "") if isinstance(session_data, dict) else "")
+        ).strip()
+
+        if uid_str:
+            try:
+                cl._user_id = int(uid_str)          # internal attr — works in instagrapi v1 & v2
+                cl.user_id  = int(uid_str)          # try the property too, may work in older versions
+            except (AttributeError, ValueError):
+                try:
+                    cl._user_id = int(uid_str)
+                except Exception:
+                    pass
+
+        logger.info(f"user_id set to: {uid_str}")
 
     except Exception as e:
-        logger.error(f"login_by_sessionid() failed: {type(e).__name__}: {e}")
+        logger.error(f"Cookie injection failed: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())
-        # Session may be expired — but still mark ready so user gets a real error
-        # when they run a command, not a generic "session not loaded" wall.
-        logger.warning("Marking ready=False. Session is expired or invalid.")
         return False
 
-    # ── Override user_id if explicitly set ────────────────────────────────
-    if IG_USER_ID:
-        try:
-            cl.user_id = int(IG_USER_ID.strip())
-        except ValueError:
-            pass  # keep whatever login_by_sessionid resolved
-
-    state.ig = cl
-    state.ready = True
-    state.user_id_num = cl.user_id
-    state.username = IG_USERNAME or f"uid:{cl.user_id}"
-    logger.info(f"✅ Instagram session ready — user_id={cl.user_id}, username={state.username}")
+    # ── Mark ready — real validation happens on first command ─────────────
+    state.ig           = cl
+    state.ready        = True
+    state.user_id_num  = int(uid_str) if uid_str else None
+    state.username     = IG_USERNAME or f"uid:{uid_str}"
+    logger.info(f"✅ Session loaded (no challenge) — user_id={state.user_id_num}, username={state.username}")
     return True
 
 
