@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.local
+ig_session.json
+*.session
+.DS_Store
