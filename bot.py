@@ -85,43 +85,86 @@ def auth_required(func):
 
 # ── Instagram session bootstrap ───────────────────────────────────────────────
 def load_session() -> bool:
-    """Load Instagram session from IG_SESSION_JSON env var."""
+    """
+    Load Instagram session from IG_SESSION_JSON env var.
+
+    Accepts two formats:
+      1. Full instagrapi settings JSON  → from get_session.py output
+      2. Minimal cookie JSON            → {"sessionid":"...","csrftoken":"...","ds_user_id":"..."}
+    """
     global state
 
-    if not IG_SESSION_JSON:
-        logger.warning("IG_SESSION_JSON not set. Bot will start but IG commands won't work.")
+    raw = IG_SESSION_JSON.strip()
+    if not raw:
+        logger.warning("IG_SESSION_JSON not set — IG commands disabled.")
+        return False
+
+    try:
+        session_data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"IG_SESSION_JSON is not valid JSON: {e}")
+        logger.error("Make sure you copied the full JSON including outer { } braces.")
         return False
 
     try:
         cl = Client()
         cl.delay_range = [API_DELAY, API_DELAY + 0.5]
 
-        # Parse the session JSON
-        session_data = json.loads(IG_SESSION_JSON)
-        cl.set_settings(session_data)
+        # ── Detect format and apply session ──────────────────────────────
+        # Format 1: full instagrapi settings (has "authorization_data" or "cookies" key)
+        if "authorization_data" in session_data or "cookies" in session_data:
+            logger.info("Loading full instagrapi settings...")
+            cl.set_settings(session_data)
 
-        # Verify the session works
-        uid = IG_USER_ID or session_data.get("user_id") or session_data.get("ds_user_id")
+        # Format 2: minimal cookie dict {"sessionid":..., "csrftoken":..., "ds_user_id":...}
+        elif "sessionid" in session_data:
+            logger.info("Loading from cookie values...")
+            cl.set_settings({
+                "cookies": {
+                    "sessionid":  session_data.get("sessionid", ""),
+                    "csrftoken":  session_data.get("csrftoken", ""),
+                    "ds_user_id": session_data.get("ds_user_id", ""),
+                    "mid":        session_data.get("mid", ""),
+                    "ig_did":     session_data.get("ig_did", ""),
+                    "rur":        session_data.get("rur", ""),
+                },
+                "last_login": 0,
+                "device_settings": {},
+                "user_agent": "Instagram 269.0.0.18.75 Android",
+            })
+        else:
+            logger.error("Unrecognized session JSON format. See /session in the bot for instructions.")
+            return False
+
+        # ── Resolve user ID ───────────────────────────────────────────────
+        uid = (
+            IG_USER_ID
+            or session_data.get("user_id")
+            or session_data.get("ds_user_id")
+            or (session_data.get("cookies") or {}).get("ds_user_id")
+        )
         if uid:
-            cl.user_id = int(uid)
+            try:
+                cl.user_id = int(str(uid).strip())
+            except ValueError:
+                pass
 
-        # Test call
-        cl.get_timeline_feed()
-
+        # ── Accept session without a test call ───────────────────────────
+        # We skip get_timeline_feed() because it triggers 2FA/challenge on
+        # some accounts even with valid sessions. We'll fail gracefully on
+        # the first real command instead.
         state.ig = cl
         state.ready = True
         state.user_id_num = cl.user_id
-        logger.info(f"Instagram session loaded. User ID: {cl.user_id}")
+        state.username = IG_USERNAME or f"uid:{cl.user_id}"
+        logger.info(f"✅ Instagram session loaded — user_id={cl.user_id}")
         return True
 
-    except json.JSONDecodeError as e:
-        logger.error(f"IG_SESSION_JSON is not valid JSON: {e}")
-        return False
     except LoginRequired:
-        logger.error("Session expired or invalid. Generate a new session and update IG_SESSION_JSON.")
+        logger.error("Session expired or invalid. Run get_session.py again and update IG_SESSION_JSON.")
         return False
     except Exception as e:
-        logger.error(f"Session load failed: {e}")
+        logger.error(f"Session load failed: {type(e).__name__}: {e}")
         return False
 
 
@@ -477,6 +520,67 @@ async def cmd_setdays(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Archive window set to *{days} days*\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
 
+
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update): return
+    raw = IG_SESSION_JSON.strip()
+    has_json = bool(raw)
+    json_valid = False
+    json_format = "not checked"
+    has_sessionid = False
+
+    if has_json:
+        try:
+            d = json.loads(raw)
+            json_valid = True
+            if "authorization_data" in d or "cookies" in d:
+                json_format = "full instagrapi settings OK"
+            elif "sessionid" in d:
+                json_format = "minimal cookie dict OK"
+            else:
+                json_format = "unrecognized keys: " + ", ".join(list(d.keys())[:5])
+            has_sessionid = bool(
+                d.get("sessionid") or
+                (d.get("cookies") or {}).get("sessionid") or
+                d.get("authorization_data")
+            )
+        except Exception as e:
+            json_format = f"JSON parse error: {e}"
+
+    lines = [
+        "DEBUG Session Diagnostics",
+        "IG_SESSION_JSON set: " + ("YES" if has_json else "NO"),
+        "JSON valid: " + ("YES" if json_valid else "NO"),
+        "Format: " + json_format,
+        "Has auth token: " + ("YES" if has_sessionid else "NO"),
+        "IG_USER_ID set: " + (IG_USER_ID or "not set"),
+        "IG_USERNAME set: " + (IG_USERNAME or "not set"),
+        "Bot state ready: " + ("YES" if state.ready else "NO"),
+        "Client user_id: " + str(state.user_id_num or "not set"),
+    ]
+
+    if not has_json:
+        lines.append("\nFIX: Set IG_SESSION_JSON in Railway Variables and redeploy.")
+    elif not json_valid:
+        lines.append("\nFIX: JSON is malformed. Re-run get_session.py and copy again.")
+    elif not state.ready:
+        lines.append("\nFIX: Send /reload to retry loading the session.")
+    else:
+        lines.append("\nAll good! Try /status to test a live API call.")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_reload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update): return
+    msg = await update.message.reply_text("Reloading Instagram session...")
+    ok = load_session()
+    if ok:
+        await msg.edit_text(f"Session reloaded!\n\nUser ID: {state.user_id_num}\nUsername: {state.username}")
+    else:
+        await msg.edit_text("Session reload failed. Check Railway logs.\n\nRun /debug to diagnose.")
+
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled exception:", exc_info=ctx.error)
 
@@ -505,6 +609,8 @@ def main():
     app.add_handler(CommandHandler("preview_kill", cmd_preview_kill))
     app.add_handler(CommandHandler("posts",        cmd_posts))
     app.add_handler(CommandHandler("setdays",      cmd_setdays))
+    app.add_handler(CommandHandler("debug",        cmd_debug))
+    app.add_handler(CommandHandler("reload",       cmd_reload))
     app.add_handler(CallbackQueryHandler(kill_callback, pattern="^kill_"))
     app.add_error_handler(error_handler)
 
