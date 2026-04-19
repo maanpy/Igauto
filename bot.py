@@ -103,45 +103,61 @@ def load_session() -> bool:
         session_data = json.loads(raw)
     except json.JSONDecodeError as e:
         logger.error(f"IG_SESSION_JSON is not valid JSON: {e}")
-        logger.error("Make sure you copied the full JSON including outer { } braces.")
+        logger.error("Make sure you copied the full JSON without wrapping quotes.")
         return False
 
     try:
         cl = Client()
         cl.delay_range = [API_DELAY, API_DELAY + 0.5]
 
-        # ── Detect format and apply session ──────────────────────────────
-        # Format 1: full instagrapi settings (has "authorization_data" or "cookies" key)
-        if "authorization_data" in session_data or "cookies" in session_data:
-            logger.info("Loading full instagrapi settings...")
-            cl.set_settings(session_data)
+        # ── Normalise: convert list of cookie objects → flat dict ─────────
+        # Format 3: browser cookie export — a LIST of objects like:
+        # [{"name":"sessionid","value":"abc..."},{"name":"csrftoken","value":"xyz..."},...]
+        if isinstance(session_data, list):
+            logger.info("Detected cookie-list format (browser export). Converting...")
+            cookie_dict = {c["name"]: c["value"] for c in session_data if "name" in c and "value" in c}
+            session_data = cookie_dict  # now treat as flat dict below
 
-        # Format 2: minimal cookie dict {"sessionid":..., "csrftoken":..., "ds_user_id":...}
-        elif "sessionid" in session_data:
-            logger.info("Loading from cookie values...")
-            cl.set_settings({
-                "cookies": {
-                    "sessionid":  session_data.get("sessionid", ""),
-                    "csrftoken":  session_data.get("csrftoken", ""),
-                    "ds_user_id": session_data.get("ds_user_id", ""),
-                    "mid":        session_data.get("mid", ""),
-                    "ig_did":     session_data.get("ig_did", ""),
-                    "rur":        session_data.get("rur", ""),
-                },
-                "last_login": 0,
-                "device_settings": {},
-                "user_agent": "Instagram 269.0.0.18.75 Android",
-            })
+        # ── Detect format and apply session ──────────────────────────────
+        if isinstance(session_data, dict):
+            # Format 1: full instagrapi settings (has "authorization_data" or "cookies" key)
+            if "authorization_data" in session_data or (
+                "cookies" in session_data and isinstance(session_data["cookies"], dict)
+            ):
+                logger.info("Loading full instagrapi settings...")
+                cl.set_settings(session_data)
+
+            # Format 2 & 3: flat cookie dict {"sessionid":..., "csrftoken":..., ...}
+            elif "sessionid" in session_data:
+                logger.info("Loading from flat cookie dict...")
+                cl.set_settings({
+                    "cookies": {
+                        "sessionid":  session_data.get("sessionid", ""),
+                        "csrftoken":  session_data.get("csrftoken", ""),
+                        "ds_user_id": session_data.get("ds_user_id", ""),
+                        "mid":        session_data.get("mid", ""),
+                        "ig_did":     session_data.get("ig_did", ""),
+                        "rur":        session_data.get("rur", ""),
+                    },
+                    "last_login": 0,
+                    "device_settings": {},
+                    "user_agent": "Instagram 269.0.0.18.75 Android",
+                })
+            else:
+                known_keys = ", ".join(list(session_data.keys())[:8])
+                logger.error(f"Unrecognized session dict keys: {known_keys}")
+                logger.error("Expected 'sessionid', 'cookies', or 'authorization_data' key.")
+                return False
         else:
-            logger.error("Unrecognized session JSON format. See /session in the bot for instructions.")
+            logger.error(f"Unexpected session data type: {type(session_data)}")
             return False
 
         # ── Resolve user ID ───────────────────────────────────────────────
         uid = (
             IG_USER_ID
-            or session_data.get("user_id")
-            or session_data.get("ds_user_id")
-            or (session_data.get("cookies") or {}).get("ds_user_id")
+            or (session_data.get("ds_user_id") if isinstance(session_data, dict) else None)
+            or (session_data.get("user_id") if isinstance(session_data, dict) else None)
+            or ((session_data.get("cookies") or {}).get("ds_user_id") if isinstance(session_data, dict) else None)
         )
         if uid:
             try:
@@ -533,40 +549,62 @@ async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             d = json.loads(raw)
             json_valid = True
-            if "authorization_data" in d or "cookies" in d:
-                json_format = "full instagrapi settings OK"
-            elif "sessionid" in d:
-                json_format = "minimal cookie dict OK"
+
+            # Handle list format (browser cookie export)
+            if isinstance(d, list):
+                cookie_dict = {c["name"]: c["value"] for c in d if "name" in c and "value" in c}
+                json_format = f"browser cookie list ({len(d)} cookies) - auto-converted"
+                has_sessionid = bool(cookie_dict.get("sessionid"))
+
+            elif isinstance(d, dict):
+                if "authorization_data" in d or (
+                    "cookies" in d and isinstance(d["cookies"], dict)
+                ):
+                    json_format = "full instagrapi settings"
+                    has_sessionid = bool(
+                        d.get("authorization_data") or
+                        (d.get("cookies") or {}).get("sessionid")
+                    )
+                elif "sessionid" in d:
+                    json_format = "flat cookie dict"
+                    has_sessionid = True
+                else:
+                    json_format = "unknown dict — keys: " + ", ".join(list(d.keys())[:6])
+                    has_sessionid = False
             else:
-                json_format = "unrecognized keys: " + ", ".join(list(d.keys())[:5])
-            has_sessionid = bool(
-                d.get("sessionid") or
-                (d.get("cookies") or {}).get("sessionid") or
-                d.get("authorization_data")
-            )
+                json_format = f"unexpected type: {type(d).__name__}"
+
         except Exception as e:
-            json_format = f"JSON parse error: {e}"
+            json_format = f"parse error: {e}"
 
     lines = [
-        "DEBUG Session Diagnostics",
-        "IG_SESSION_JSON set: " + ("YES" if has_json else "NO"),
-        "JSON valid: " + ("YES" if json_valid else "NO"),
-        "Format: " + json_format,
-        "Has auth token: " + ("YES" if has_sessionid else "NO"),
-        "IG_USER_ID set: " + (IG_USER_ID or "not set"),
-        "IG_USERNAME set: " + (IG_USERNAME or "not set"),
-        "Bot state ready: " + ("YES" if state.ready else "NO"),
-        "Client user_id: " + str(state.user_id_num or "not set"),
+        "🔍 DEBUG — Session Diagnostics",
+        "━━━━━━━━━━━━━━━━━━",
+        f"IG_SESSION_JSON set : {'YES' if has_json else 'NO ❌'}",
+        f"JSON valid          : {'YES' if json_valid else 'NO ❌'}",
+        f"Format detected     : {json_format}",
+        f"Has sessionid token : {'YES ✅' if has_sessionid else 'NO ❌'}",
+        f"IG_USER_ID set      : {IG_USER_ID or 'not set'}",
+        f"IG_USERNAME set     : {IG_USERNAME or 'not set'}",
+        f"Bot state ready     : {'YES ✅' if state.ready else 'NO ❌'}",
+        f"Client user_id      : {state.user_id_num or 'not set'}",
+        "━━━━━━━━━━━━━━━━━━",
     ]
 
     if not has_json:
-        lines.append("\nFIX: Set IG_SESSION_JSON in Railway Variables and redeploy.")
+        lines.append("FIX: Set IG_SESSION_JSON in Railway Variables and redeploy.")
     elif not json_valid:
-        lines.append("\nFIX: JSON is malformed. Re-run get_session.py and copy again.")
+        lines.append("FIX: JSON is malformed. Re-run get_session.py and copy the output.")
+    elif not has_sessionid:
+        lines.append(
+            "FIX: Your JSON does not contain a sessionid.\n"
+            "Run get_session.py locally and paste the FULL output as IG_SESSION_JSON.\n"
+            "It must start with { and contain 'cookies' or 'sessionid'."
+        )
     elif not state.ready:
-        lines.append("\nFIX: Send /reload to retry loading the session.")
+        lines.append("Session looks valid. Send /reload to apply it now.")
     else:
-        lines.append("\nAll good! Try /status to test a live API call.")
+        lines.append("All good! Try /status to test a live API call.")
 
     await update.message.reply_text("\n".join(lines))
 
