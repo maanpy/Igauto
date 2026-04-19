@@ -238,7 +238,14 @@ async def fetch_posts(amount=50) -> list:
 
 async def fetch_archived() -> list:
     cl = get_ig()
-    return cl.media_archived_medias()
+    # Method name changed across instagrapi versions — try all known names
+    for method_name in ("archived_medias", "media_archived_medias"):
+        if hasattr(cl, method_name):
+            logger.info(f"fetch_archived: using cl.{method_name}()")
+            return getattr(cl, method_name)()
+    raise AttributeError(
+        "No archived-media method found. Tried: archived_medias, media_archived_medias"
+    )
 
 def escape(text: str) -> str:
     """Escape special chars for MarkdownV2."""
@@ -362,7 +369,11 @@ async def cmd_archive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for i, media in enumerate(targets, 1):
             try:
-                cl.media_archive(media.pk)
+                # Try both known method names for archiving
+                _archive_fn = getattr(cl, "media_archive", None) or getattr(cl, "media_only_me", None)
+                if not _archive_fn:
+                    raise AttributeError("No archive method found on Client (tried: media_archive)")
+                _archive_fn(media.pk)
                 archived += 1
             except Exception as e:
                 logger.warning(f"Archive failed {media.pk}: {e}")
@@ -399,7 +410,11 @@ async def cmd_unarchive(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         for i, media in enumerate(archived_posts, 1):
             try:
-                cl.media_unarchive(media.pk)
+                # Try both known method names for unarchiving
+                _unarchive_fn = getattr(cl, "media_unarchive", None) or getattr(cl, "media_undo_only_me", None)
+                if not _unarchive_fn:
+                    raise AttributeError("No unarchive method found on Client (tried: media_unarchive)")
+                _unarchive_fn(media.pk)
                 restored += 1
             except Exception as e:
                 logger.warning(f"Unarchive failed {media.pk}: {e}")
